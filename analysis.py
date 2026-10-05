@@ -1,23 +1,38 @@
 """Recording loading and conservative acquisition-quality checks."""
 from pathlib import Path
+from io import BytesIO
 import numpy as np
 import pandas as pd
+
+
+def parse_metadata(text):
+    meta = {}
+    for line in text.lstrip('\ufeff').splitlines():
+        if '=' in line:
+            key, value = line.split('=', 1)
+            meta[key.strip()] = value.strip()
+    return meta
+
+
+def normalize_recording(df, meta):
+    channels = [c for c in df if c.startswith('Ch') and c[2:].isdigit()]
+    for c in ['Timestamp_ms', *channels]:
+        if c in df:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+    return df, meta, channels
 
 
 def load_recording(path):
     path = Path(path)
     meta = {}
     for file in path.parent.glob('metadata*.txt'):
-        for line in file.read_text(encoding='utf-8-sig').splitlines():
-            if '=' in line:
-                key, value = line.split('=', 1)
-                meta[key] = value
-    df = pd.read_csv(path)
-    channels = [c for c in df if c.startswith('Ch') and c[2:].isdigit()]
-    for c in ['Timestamp_ms', *channels]:
-        if c in df:
-            df[c] = pd.to_numeric(df[c], errors='coerce')
-    return df, meta, channels
+        meta.update(parse_metadata(file.read_text(encoding='utf-8-sig')))
+    return normalize_recording(pd.read_csv(path), meta)
+
+
+def load_uploaded_recording(csv_bytes, metadata=None):
+    """Read uploads in memory without writing recordings to disk."""
+    return normalize_recording(pd.read_csv(BytesIO(csv_bytes)), metadata or {})
 
 
 def inspect_recording(df, meta, channels):

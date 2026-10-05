@@ -7,7 +7,7 @@ import plotly.graph_objects as go
 from plotly.colors import qualitative
 from plotly.subplots import make_subplots
 import streamlit as st
-from analysis import load_recording, inspect_recording
+from analysis import load_recording, load_uploaded_recording, parse_metadata, inspect_recording
 
 
 def csv_download_link(data, filename, label):
@@ -27,20 +27,68 @@ st.caption('Browse recordings, compare channels, and review acquisition issues.'
 def read(path, modified):
     return load_recording(path)
 
-root = st.sidebar.text_input('Data folder', str(Path(__file__).parent / 'EMG_DataSet_Fall26'))
-folder = Path(root)
-if not folder.is_dir():
-    st.info('Enter an existing data folder in the sidebar.')
-    st.stop()
-files = sorted(folder.rglob('emg_data*.csv'))
-if not files:
-    st.info('No emg_data*.csv recordings found.')
-    st.stop()
-file = st.sidebar.selectbox('Recording', files, format_func=lambda p: p.parent.name)
+default_folder = Path(__file__).parent / 'EMG_DataSet_Fall26'
+source = st.sidebar.radio('Data source', ['Upload recordings', 'Local folder'],
+                          index=1 if default_folder.is_dir() else 0)
+upload_metadata = {}
+if source == 'Upload recordings':
+    st.sidebar.caption('Upload CSV recordings and optional metadata TXT files. On a hosted app, uploads are sent to the app server for this session.')
+    files = st.sidebar.file_uploader('Recording CSV files', type=['csv'], accept_multiple_files=True, key='recording_uploads')
+    metadata_files = st.sidebar.file_uploader('Metadata TXT files (optional)', type=['txt'], accept_multiple_files=True, key='metadata_uploads')
+    for item in metadata_files:
+        try:
+            upload_metadata[item.name] = parse_metadata(item.getvalue().decode('utf-8-sig'))
+        except UnicodeDecodeError:
+            st.sidebar.warning(f'{item.name}: metadata must be UTF-8 text.')
+    if not files:
+        st.info('Upload one or more recording CSV files in the sidebar to start. Metadata TXT files are optional.')
+        st.stop()
+    def metadata_for(item):
+        expected = 'metadata_' + Path(item.name).stem.removeprefix('emg_data_') + '.txt'
+        matches = [meta for name, meta in upload_metadata.items()
+                   if name == expected or Path(meta.get('data_file', '')).name == item.name]
+        if len(matches) == 1:
+            return matches[0]
+        if not matches and len(files) == 1 and len(upload_metadata) == 1:
+            name, meta = next(iter(upload_metadata.items()))
+            if not meta.get('data_file') or Path(meta['data_file']).name == item.name:
+                return meta
+        return {}
+    def load_source(item):
+        return load_uploaded_recording(item.getvalue(), metadata_for(item))
+    selected_file = st.sidebar.selectbox('Recording', files, format_func=lambda item: item.name, key='uploaded_recording')
+    file = Path(selected_file.name)
+    recording_title = file.stem.removeprefix('emg_data_')
+else:
+    root = st.sidebar.text_input('Data folder', str(default_folder))
+    folder = Path(root)
+    if not folder.is_dir():
+        st.info('Enter an existing server-side data folder, or select Upload recordings.')
+        st.stop()
+    files = sorted(folder.rglob('emg_data*.csv'))
+    if not files:
+        st.info('No emg_data*.csv recordings found. You can also select Upload recordings.')
+        st.stop()
+    def load_source(item):
+        return read(str(item), item.stat().st_mtime_ns)
+    selected_file = st.sidebar.selectbox('Recording', files, format_func=lambda p: p.parent.name, key='local_recording')
+    file = selected_file
+    recording_title = file.parent.name
 if st.sidebar.button('Refresh data'):
     st.cache_data.clear()
+    st.session_state.pop('loaded_upload', None)
 try:
-    df, meta, channels = read(str(file), file.stat().st_mtime_ns)
+    if source == 'Upload recordings':
+        # Keep parsed uploads in this session rather than a cache shared by users.
+        identity = (selected_file.file_id, tuple(sorted(metadata_for(selected_file).items())))
+        previous = st.session_state.get('loaded_upload')
+        if previous is None or previous[0] != identity:
+            st.session_state.loaded_upload = (identity, load_source(selected_file))
+        df, meta, channels = st.session_state.loaded_upload[1]
+        if not meta:
+            st.sidebar.caption('No matching metadata for this recording. Timing checks use the median positive sample interval; metadata-dependent checks are skipped.')
+    else:
+        df, meta, channels = load_source(selected_file)
 except Exception as exc:
     st.error(f'Cannot read {file.name}: {exc}')
     st.stop()
@@ -161,7 +209,7 @@ with quality_tab:
         with st.expander('Rows with duplicate or backward timestamps'):
             st.dataframe(df.loc[bad].head(1000), width='stretch')
 with summary_tab:
-    st.subheader(file.parent.name)
+    st.subheader(recording_title)
     if all(c in df for c in ['Trial_ID', 'Label']):
         summary = df.groupby(['Trial_ID', 'Label'], dropna=False).size().reset_index(name='Samples')
         st.dataframe(summary, hide_index=True, width='stretch')
@@ -174,10 +222,11 @@ with summary_tab:
         progress = st.progress(0)
         for i, p in enumerate(files):
             try:
-                data, metadata, ch = read(str(p), p.stat().st_mtime_ns)
+                data, metadata, ch = load_source(p)
                 report = inspect_recording(data, metadata, ch)
-                rows.append({'Recording': p.parent.name, 'Samples': len(data), 'Channels': len(ch), 'Review checks': len(report), 'Errors': int(report.Severity.eq('Error').sum())})
+                name = p.name if source == 'Upload recordings' else p.parent.name
+                rows.append({'Recording': name, 'Samples': len(data), 'Channels': len(ch), 'Review checks': len(report), 'Errors': int(report.Severity.eq('Error').sum())})
             except Exception as exc:
-                rows.append({'Recording': p.parent.name, 'Read error': str(exc)})
+                rows.append({'Recording': p.name, 'Read error': str(exc)})
             progress.progress((i+1)/len(files))
         st.dataframe(pd.DataFrame(rows), hide_index=True, width='stretch')
